@@ -248,6 +248,42 @@ fn build_mime(
         .map_err(|e| Error::Transient(format!("mime build: {e}")))
 }
 
+/// Best-effort contact ingestion from a batch of envelopes. Never fails the
+/// pull — any I/O or serialization issue is logged and swallowed.
+fn ingest_contacts_best_effort<'a>(
+    account: &str,
+    envs: impl IntoIterator<Item = &'a email::envelope::Envelope>,
+) {
+    let path = match crate::contacts::default_store_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "contact index: cannot resolve path");
+            return;
+        }
+    };
+    let mut all_obs = Vec::new();
+    for env in envs {
+        let date = env.date.to_rfc3339();
+        let from = if env.from.addr.is_empty() {
+            None
+        } else {
+            Some((env.from.addr.as_str(), env.from.name.as_deref()))
+        };
+        let to = if env.to.addr.is_empty() {
+            Vec::new()
+        } else {
+            vec![(env.to.addr.as_str(), env.to.name.as_deref())]
+        };
+        let cc: Vec<(&str, Option<&str>)> = Vec::new();
+        all_obs.extend(crate::contacts::observations_from_envelope(
+            account, &date, from, &to, &cc,
+        ));
+    }
+    if let Err(e) = crate::contacts::ingest_batch(&path, &all_obs) {
+        tracing::warn!(error = %e, "contact ingestion failed");
+    }
+}
+
 /// Build an IMAP SEARCH criteria string for use with async-imap `uid_search`.
 /// Combines `UNSEEN` (if we're filtering unread) with `SINCE <date>` (if we have
 /// a date cutoff). Returns `"ALL"` if no filters apply.
@@ -575,6 +611,10 @@ async fn pull(args: MessagePullArgs, global: &GlobalArgs, fmt: OutputFormat) -> 
         envelopes.len(),
         filter_source
     );
+
+    // ── Best-effort contact ingestion. Every envelope's From/To addresses
+    // are appended to the local contact index. Failures here NEVER break pull.
+    ingest_contacts_best_effort(&account.name, envelopes.iter());
 
     // Resolve attachments root once (only used if attachments requested).
     let want_attachments = !args.no_attachments;
@@ -989,7 +1029,7 @@ async fn reply(args: MessageReplyArgs, global: &GlobalArgs, fmt: OutputFormat) -
         &body,
         Some(&in_reply_to),
         Some(&references),
-        &[],
+        &args.attach,
     )?;
 
     if !args.send {
@@ -1001,6 +1041,7 @@ async fn reply(args: MessageReplyArgs, global: &GlobalArgs, fmt: OutputFormat) -
                 "to": to,
                 "cc": cc,
                 "subject": subject,
+                "attachment_count": args.attach.len(),
                 "in_reply_to": in_reply_to,
                 "body_bytes": body.len(),
                 "mime_size": raw.len(),

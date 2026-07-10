@@ -77,6 +77,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Local contact index built up from senders/recipients of pulled messages.
+    Contact {
+        #[command(subcommand)]
+        command: ContactCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -318,6 +323,9 @@ pub struct MessageReplyArgs {
     /// Body file path, or `-` to read from stdin. Mutually exclusive with --body.
     #[arg(long, group = "reply_body_source")]
     pub body_file: Option<String>,
+    /// Attach files to the reply. Repeatable.
+    #[arg(long)]
+    pub attach: Vec<PathBuf>,
     #[arg(long)]
     pub reply_all: bool,
     #[arg(long, group = "send_mode")]
@@ -413,4 +421,65 @@ pub struct AttachmentClearArgs {
 pub enum ConfigCommand {
     /// Print current config (without secrets).
     Show,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ContactCommand {
+    /// Search the local contact index (case-insensitive substring match on
+    /// email AND names by default). Names include full-form ("张三"), Latin
+    /// ("Alice Smith"), and any display name that ever appeared in mail headers.
+    Search(ContactSearchArgs),
+    /// List all known contacts, most-recently-seen first.
+    List(ContactListArgs),
+    /// Show one contact's full record by exact email.
+    Show {
+        #[arg(value_name = "EMAIL")]
+        email: String,
+    },
+    /// Delete the local contact index file. Missing file is a no-op.
+    Clear,
+    /// Print the store path (useful for scripting / debugging).
+    Path,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ContactSearchArgs {
+    /// Search term. Case-insensitive substring; passing multiple terms (space
+    /// or comma-separated) requires ALL to match somewhere.
+    #[arg(value_name = "TERM", required = true, num_args = 1.., value_delimiter = ',')]
+    pub query: Vec<String>,
+    /// Which fields to look in.
+    #[arg(long, value_enum, default_value_t = ContactSearchField::Any)]
+    pub field: ContactSearchField,
+    /// Max results (default 20).
+    #[arg(long, default_value_t = 20)]
+    pub limit: u32,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ContactSearchField {
+    /// Match either email or any name.
+    Any,
+    /// Only match on email address.
+    Email,
+    /// Only match on display names.
+    Name,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct ContactListArgs {
+    #[arg(long, default_value_t = 50)]
+    pub limit: u32,
+    #[arg(long, value_enum, default_value_t = ContactSort::LastSeen)]
+    pub sort: ContactSort,
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+pub enum ContactSort {
+    /// Most recently seen first.
+    LastSeen,
+    /// Most-mailed first.
+    Count,
+    /// Alphabetical by email.
+    Email,
 }

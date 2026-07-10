@@ -4,6 +4,7 @@ mod backend;
 mod cli;
 mod commands;
 mod config;
+mod contacts;
 mod credentials;
 mod error;
 mod html;
@@ -70,6 +71,7 @@ async fn dispatch(cli: Cli) -> error::Result<()> {
         Command::Message { command } => commands::message::run(command, &global, fmt).await,
         Command::Attachment { command } => commands::attachment::run(command, &global, fmt).await,
         Command::Config { command } => commands::config::run(command, &global, fmt).await,
+        Command::Contact { command } => commands::contact::run(command, &global, fmt).await,
     }
 }
 

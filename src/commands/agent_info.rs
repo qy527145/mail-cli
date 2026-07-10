@@ -177,7 +177,7 @@ fn manifest() -> Value {
                     {"name": "--send", "type": "flag"}
                 ]
             },
-            {"path": "message reply", "description": "Reply to a message. Same --body / --body-file rules as `message send`."},
+            {"path": "message reply", "description": "Reply to a message. Same --body / --body-file rules as `message send`. Supports --attach (repeatable) for attachments."},
             {"path": "message flag", "description": "Add/remove IMAP flags on a message."},
             {"path": "message archive", "description": "Move message to archive folder."},
             {
@@ -204,7 +204,29 @@ fn manifest() -> Value {
                 ],
                 "example": "mail-cli attachment clear --older-than 7d --dry-run"
             },
-            {"path": "config show", "description": "Show current configuration (no secrets)."}
+            {"path": "config show", "description": "Show current configuration (no secrets)."},
+            {
+                "path": "contact search",
+                "description": "Search the local contact index (built up from senders/recipients of every `message pull`). Case-insensitive substring on email or display name.",
+                "arguments": [
+                    {"name": "<TERM>...", "required": true, "description": "search term(s); multiple terms require ALL to match; comma-separated OK"},
+                    {"name": "--field", "values": ["any", "email", "name"], "default": "any"},
+                    {"name": "--limit", "default": 20}
+                ],
+                "example": "mail-cli contact search alice"
+            },
+            {
+                "path": "contact list",
+                "description": "List all known contacts.",
+                "arguments": [
+                    {"name": "--limit", "default": 50},
+                    {"name": "--sort", "values": ["last-seen", "count", "email"], "default": "last-seen"}
+                ]
+            },
+            {"path": "contact show", "description": "Show one contact by exact email.",
+             "arguments": [{"name": "<EMAIL>", "required": true}]},
+            {"path": "contact clear", "description": "Delete the local contact index file."},
+            {"path": "contact path", "description": "Print the store file path + size (useful for scripting)."}
         ],
         "envelope_schema": {
             "id": "string (IMAP UID)",
