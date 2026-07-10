@@ -4,7 +4,9 @@ use serde::Serialize;
 use serde_json::json;
 use tracing::info;
 
-use crate::cli::{AccountAddArgs, AccountCommand, GlobalArgs};
+use crate::cli::{
+    AccountAddArgs, AccountCommand, AllowlistCommand, AllowlistMutateArgs, GlobalArgs,
+};
 use crate::config::account::{Encryption, ImapConfig, SmtpConfig};
 use crate::config::{AccountConfig, ConfigFile};
 use crate::credentials;
@@ -16,6 +18,7 @@ pub async fn run(cmd: AccountCommand, global: &GlobalArgs, fmt: OutputFormat) ->
         AccountCommand::Add(args) => add(args, global, fmt).await,
         AccountCommand::List => list(global, fmt).await,
         AccountCommand::Remove { name } => remove(&name, global, fmt).await,
+        AccountCommand::Allowlist { command } => allowlist(command, global, fmt).await,
     }
 }
 
@@ -49,13 +52,24 @@ async fn add(args: AccountAddArgs, global: &GlobalArgs, fmt: OutputFormat) -> Re
         )));
     }
 
-    let account = AccountConfig {
-        email,
-        send_allowlist: cfg
-            .accounts
+    // Seed / preserve send_allowlist:
+    //   - if --send-allow was given, use those (replacing on --force)
+    //   - else preserve the existing entries (empty on fresh add)
+    let seeded_allowlist: Vec<String> = if !args.send_allow.is_empty() {
+        let mut list = args.send_allow.clone();
+        list.sort();
+        list.dedup();
+        list
+    } else {
+        cfg.accounts
             .get(&args.name)
             .map(|prev| prev.send_allowlist.clone())
-            .unwrap_or_default(),
+            .unwrap_or_default()
+    };
+
+    let account = AccountConfig {
+        email,
+        send_allowlist: seeded_allowlist,
         archive_folder: cfg
             .accounts
             .get(&args.name)
@@ -81,7 +95,10 @@ async fn add(args: AccountAddArgs, global: &GlobalArgs, fmt: OutputFormat) -> Re
     credentials::store(&credentials::imap_key(&args.name), &password).await?;
     credentials::store(&credentials::smtp_key(&args.name), &password).await?;
 
-    if cfg.default_account.is_none() {
+    // Update default_account:
+    //   - explicit --default (`-p`) always wins
+    //   - otherwise, first-account-added becomes default (unchanged behavior)
+    if args.set_default || cfg.default_account.is_none() {
         cfg.default_account = Some(args.name.clone());
     }
     cfg.accounts.insert(args.name.clone(), account);
@@ -182,4 +199,129 @@ async fn remove(name: &str, global: &GlobalArgs, fmt: OutputFormat) -> Result<()
     cfg.save(&path)?;
     emit(&json!({ "status": "ok", "removed": name }), fmt)?;
     Ok(())
+}
+
+async fn allowlist(cmd: AllowlistCommand, global: &GlobalArgs, fmt: OutputFormat) -> Result<()> {
+    match cmd {
+        AllowlistCommand::Add(args) => allow_mutate(args, global, fmt, MutateOp::Add).await,
+        AllowlistCommand::Remove(args) => allow_mutate(args, global, fmt, MutateOp::Remove).await,
+        AllowlistCommand::Set(args) => allow_mutate(args, global, fmt, MutateOp::Set).await,
+        AllowlistCommand::Clear { name } => allow_clear(&name, global, fmt).await,
+        AllowlistCommand::Show { name } => allow_show(&name, global, fmt).await,
+    }
+}
+
+enum MutateOp {
+    Add,
+    Remove,
+    Set,
+}
+
+async fn allow_mutate(
+    args: AllowlistMutateArgs,
+    global: &GlobalArgs,
+    fmt: OutputFormat,
+    op: MutateOp,
+) -> Result<()> {
+    let path = ConfigFile::resolve_path(global.config.as_ref())?;
+    let mut cfg = ConfigFile::load(&path)?;
+    let account = cfg
+        .accounts
+        .get_mut(&args.name)
+        .ok_or_else(|| Error::Input(format!("account '{}' not found", args.name)))?;
+
+    // Normalize incoming addresses: trim + lowercase for stable de-duplication
+    // (allowlist matching is case-insensitive anyway).
+    let incoming: Vec<String> = args
+        .addresses
+        .into_iter()
+        .map(|s| s.trim().to_lowercase())
+        .filter(|s| !s.is_empty())
+        .collect();
+
+    let before = account.send_allowlist.clone();
+    let after: Vec<String> = match op {
+        MutateOp::Add => {
+            let mut merged: Vec<String> = before
+                .iter()
+                .cloned()
+                .chain(incoming.iter().cloned())
+                .collect();
+            merged.sort();
+            merged.dedup();
+            merged
+        }
+        MutateOp::Remove => {
+            let drop: std::collections::HashSet<&str> =
+                incoming.iter().map(String::as_str).collect();
+            before
+                .iter()
+                .filter(|a| !drop.contains(a.to_lowercase().as_str()))
+                .cloned()
+                .collect()
+        }
+        MutateOp::Set => {
+            let mut list = incoming.clone();
+            list.sort();
+            list.dedup();
+            list
+        }
+    };
+
+    let added: Vec<&String> = after.iter().filter(|a| !before.contains(a)).collect();
+    let removed: Vec<&String> = before.iter().filter(|a| !after.contains(a)).collect();
+
+    account.send_allowlist = after.clone();
+    cfg.save(&path)?;
+
+    emit(
+        &json!({
+            "status": "ok",
+            "account": args.name,
+            "op": match op {
+                MutateOp::Add => "add",
+                MutateOp::Remove => "remove",
+                MutateOp::Set => "set",
+            },
+            "before": before,
+            "after": after,
+            "added": added,
+            "removed": removed,
+        }),
+        fmt,
+    )
+}
+
+async fn allow_clear(name: &str, global: &GlobalArgs, fmt: OutputFormat) -> Result<()> {
+    let path = ConfigFile::resolve_path(global.config.as_ref())?;
+    let mut cfg = ConfigFile::load(&path)?;
+    let account = cfg
+        .accounts
+        .get_mut(name)
+        .ok_or_else(|| Error::Input(format!("account '{name}' not found")))?;
+    let before = account.send_allowlist.clone();
+    account.send_allowlist.clear();
+    cfg.save(&path)?;
+    emit(
+        &json!({
+            "status": "ok",
+            "account": name,
+            "cleared": before,
+            "note": "any --send will now fail with `allowlist empty` until you add addresses back",
+        }),
+        fmt,
+    )
+}
+
+async fn allow_show(name: &str, global: &GlobalArgs, fmt: OutputFormat) -> Result<()> {
+    let path = ConfigFile::resolve_path(global.config.as_ref())?;
+    let cfg = ConfigFile::load(&path)?;
+    let account = cfg.account(name)?;
+    emit(
+        &json!({
+            "account": name,
+            "send_allowlist": account.send_allowlist,
+        }),
+        fmt,
+    )
 }

@@ -174,6 +174,20 @@ fn load_body(spec: &str) -> Result<String> {
     }
 }
 
+/// Resolve the message body from mutually-exclusive `--body` / `--body-file` args.
+/// Exactly one must be provided (clap enforces mutual exclusion, we enforce
+/// presence). `--body-file -` reads from stdin.
+fn resolve_body(body: Option<&str>, body_file: Option<&str>) -> Result<String> {
+    match (body, body_file) {
+        (Some(text), None) => Ok(text.to_string()),
+        (None, Some(path)) => load_body(path),
+        (None, None) => Err(Error::Input(
+            "one of --body <TEXT> or --body-file <PATH|-> is required".into(),
+        )),
+        (Some(_), Some(_)) => unreachable!("clap group `body_source` prevents this"),
+    }
+}
+
 fn build_mime(
     account: &AccountHandle,
     to: &[String],
@@ -878,7 +892,7 @@ async fn client_side_filter(
 
 async fn send(args: MessageSendArgs, global: &GlobalArgs, fmt: OutputFormat) -> Result<()> {
     let account = load_account(global)?;
-    let body = load_body(&args.body_file)?;
+    let body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
 
     let raw = build_mime(
         &account,
@@ -954,7 +968,7 @@ async fn reply(args: MessageReplyArgs, global: &GlobalArgs, fmt: OutputFormat) -
         .await
         .map_err(|e| Error::Transient(format!("get_envelope: {e}")))?;
 
-    let body = load_body(&args.body_file)?;
+    let body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
 
     let subject = if orig.subject.to_lowercase().starts_with("re:") {
         orig.subject.clone()

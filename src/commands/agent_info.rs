@@ -67,7 +67,11 @@ fn manifest() -> Value {
                     {"name": "--force", "type": "flag", "description": "overwrite an existing account"},
                     {"name": "--password", "description": "direct value; visible in shell history and ps"},
                     {"name": "--password-env", "value_name": "ENV_VAR", "description": "read password from this env var"},
-                    {"name": "--password-stdin", "type": "flag", "description": "read password from stdin (refuses if stdin is a tty)"}
+                    {"name": "--password-stdin", "type": "flag", "description": "read password from stdin (refuses if stdin is a tty)"},
+                    {"name": "--send-allow", "value_name": "ADDR", "multiple": true,
+                     "description": "seed send_allowlist at creation; repeatable and comma-separated; wildcard `*@domain.com` allowed"},
+                    {"name": "--default", "short": "-p", "type": "flag",
+                     "description": "make this the default account (overrides existing default); without it, only the first-added account becomes default"}
                 ],
                 "password_sources": {
                     "one_of_required": ["--password", "--password-env", "--password-stdin"],
@@ -77,6 +81,23 @@ fn manifest() -> Value {
             },
             {"path": "account list", "description": "List configured accounts (no passwords)."},
             {"path": "account remove", "description": "Remove account and its keyring entries.",
+             "arguments": [{"name": "--name", "required": true}]},
+            {
+                "path": "account allowlist add",
+                "description": "Add addresses to an account's send_allowlist (idempotent).",
+                "arguments": [
+                    {"name": "--name", "required": true},
+                    {"name": "<ADDR>...", "description": "one or more addrs; wildcard `*@domain.com` allowed; comma-separated or repeated"}
+                ],
+                "example": "mail-cli account allowlist add --name qq boss@company.com \"*@team.com\""
+            },
+            {"path": "account allowlist remove", "description": "Remove addresses from allowlist.",
+             "arguments": [{"name": "--name", "required": true}, {"name": "<ADDR>...", "description": "addrs to remove"}]},
+            {"path": "account allowlist set", "description": "Replace the entire allowlist.",
+             "arguments": [{"name": "--name", "required": true}, {"name": "<ADDR>...", "description": "full replacement list"}]},
+            {"path": "account allowlist clear", "description": "Empty the allowlist. Blocks all sends until you add addresses back.",
+             "arguments": [{"name": "--name", "required": true}]},
+            {"path": "account allowlist show", "description": "Show the current allowlist.",
              "arguments": [{"name": "--name", "required": true}]},
             {
                 "path": "message list",
@@ -149,13 +170,14 @@ fn manifest() -> Value {
                     {"name": "--cc", "multiple": true},
                     {"name": "--bcc", "multiple": true},
                     {"name": "--subject", "required": true},
-                    {"name": "--body-file", "required": true, "description": "path or '-' for stdin"},
+                    {"name": "--body", "description": "body text passed directly (mutually exclusive with --body-file); one of these is required"},
+                    {"name": "--body-file", "description": "path or '-' for stdin (mutually exclusive with --body)"},
                     {"name": "--attach", "multiple": true, "description": "attachment file path"},
                     {"name": "--dry-run", "type": "flag", "default": true},
                     {"name": "--send", "type": "flag"}
                 ]
             },
-            {"path": "message reply", "description": "Reply to a message (uses In-Reply-To/References)."},
+            {"path": "message reply", "description": "Reply to a message. Same --body / --body-file rules as `message send`."},
             {"path": "message flag", "description": "Add/remove IMAP flags on a message."},
             {"path": "message archive", "description": "Move message to archive folder."},
             {

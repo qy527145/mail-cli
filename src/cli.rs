@@ -90,6 +90,45 @@ pub enum AccountCommand {
         #[arg(long)]
         name: String,
     },
+    /// Manage the send_allowlist for an account. Send is blocked to any recipient
+    /// not matched by this list — an intentional safety gate against
+    /// prompt-injection-driven exfiltration.
+    Allowlist {
+        #[command(subcommand)]
+        command: AllowlistCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AllowlistCommand {
+    /// Add addresses (exact like `alice@x.com` or wildcard like `*@x.com`).
+    /// Idempotent: duplicates are ignored.
+    Add(AllowlistMutateArgs),
+    /// Remove addresses. Missing entries are silently ignored.
+    Remove(AllowlistMutateArgs),
+    /// Replace the entire allowlist with these addresses.
+    Set(AllowlistMutateArgs),
+    /// Clear the allowlist. After this, no `--send` will succeed until you
+    /// add an address back.
+    Clear {
+        #[arg(long)]
+        name: String,
+    },
+    /// Show the current allowlist.
+    Show {
+        #[arg(long)]
+        name: String,
+    },
+}
+
+#[derive(Debug, clap::Args)]
+pub struct AllowlistMutateArgs {
+    #[arg(long)]
+    pub name: String,
+    /// One or more addresses. Supports comma-separated (`--send-allow a,b`)
+    /// and repeated flags. Wildcards: `*@domain.com` matches any local part.
+    #[arg(value_name = "ADDR", required = true, num_args = 1.., value_delimiter = ',')]
+    pub addresses: Vec<String>,
 }
 
 #[derive(Debug, clap::Args)]
@@ -126,6 +165,20 @@ pub struct AccountAddArgs {
     /// Read password from stdin. Refuses to run if stdin is a terminal.
     #[arg(long, group = "password_source")]
     pub password_stdin: bool,
+
+    /// Seed the send_allowlist at account creation. Repeatable and comma-separated.
+    /// Example: `--send-allow boss@x.com --send-allow "*@team.com"` or `--send-allow a,b,c`.
+    /// With --force this REPLACES the existing allowlist (only when explicitly passed;
+    /// omitting the flag preserves the existing list).
+    #[arg(long = "send-allow", value_name = "ADDR", num_args = 1.., value_delimiter = ',', action = clap::ArgAction::Append)]
+    pub send_allow: Vec<String>,
+
+    /// Make this the default account for all future commands (used when
+    /// `--account` and env `MAIL_CLI_ACCOUNT` are both unset). Without this,
+    /// the first account added becomes default; subsequent adds preserve the
+    /// existing default.
+    #[arg(long = "default", short = 'p')]
+    pub set_default: bool,
 }
 
 #[derive(Debug, Subcommand)]
@@ -236,9 +289,13 @@ pub struct MessageSendArgs {
     pub bcc: Vec<String>,
     #[arg(long)]
     pub subject: String,
-    /// Body file path, or `-` to read from stdin.
-    #[arg(long)]
-    pub body_file: String,
+    /// Body text passed directly on the command line. Mutually exclusive with
+    /// --body-file. Best for short bodies; visible in shell history.
+    #[arg(long, group = "body_source")]
+    pub body: Option<String>,
+    /// Body file path, or `-` to read from stdin. Mutually exclusive with --body.
+    #[arg(long, group = "body_source")]
+    pub body_file: Option<String>,
     #[arg(long)]
     pub attach: Vec<PathBuf>,
     /// Do not actually send; return the assembled MIME (default behavior).
@@ -255,8 +312,12 @@ pub struct MessageReplyArgs {
     pub id: String,
     #[arg(long, default_value = "INBOX")]
     pub folder: String,
-    #[arg(long)]
-    pub body_file: String,
+    /// Body text passed directly on the command line. Mutually exclusive with --body-file.
+    #[arg(long, group = "reply_body_source")]
+    pub body: Option<String>,
+    /// Body file path, or `-` to read from stdin. Mutually exclusive with --body.
+    #[arg(long, group = "reply_body_source")]
+    pub body_file: Option<String>,
     #[arg(long)]
     pub reply_all: bool,
     #[arg(long, group = "send_mode")]
