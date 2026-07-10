@@ -1,0 +1,58 @@
+[package]
+name = "mail-cli"
+version = "0.1.0"
+edition = "2024"
+description = "基于 Rust 开发的高性能命令行邮件工具 mail-cli，专为 AI 代理自动化场景设计，支持 SMTP 发信、IMAP 收信、邮件查询与管理。 轻量高效、低占用、命令简洁，可无缝接入自动化脚本、服务端任务与智能代理流程。"
+license = "Apache-2.0"
+default-run = "mail-cli"
+
+[dependencies]
+# Pimalaya 邮件基座（crate 名 email-lib，模块路径 email::）
+email-lib = { version = "0.27", default-features = false, features = [
+    "tokio",
+    "tokio-rustls",
+    "rustls",
+    "imap",
+    "smtp",
+    "keyring",
+    "derive",
+    "thread",
+] }
+secret-lib = { version = "1.0", default-features = false, features = ["tokio", "rustls", "keyring", "derive"] }
+keyring-lib = { version = "1.0", default-features = false, features = ["tokio", "rustls"] }
+
+# CLI 骨架
+clap = { version = "4.5", features = ["derive", "env"] }
+tokio = { version = "1.40", features = ["rt-multi-thread", "macros", "fs", "io-std"] }
+
+# 序列化
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 配置
+toml = "0.8"
+directories = "5"
+
+# 邮件内容处理
+html2text = "0.12"
+mail-parser = "0.9"
+mail-builder = "0.3"
+
+# 兼容性 fallback：当 email-lib(imap-client 0.3) 无法解析特定服务器（如 263.net）
+# 的 IMAP 响应时，回退到 async-imap 的宽松 parser 拉取邮件原文。
+async-imap = { version = "0.11", default-features = false, features = ["runtime-tokio"] }
+futures = "0.3"
+tokio-rustls = "0.26"
+webpki-roots = "1.0"
+
+# 日志与错误
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+thiserror = "1"
+anyhow = "1"
+
+# 时间
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
