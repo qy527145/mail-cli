@@ -38,14 +38,17 @@ async fn main() {
 }
 
 fn init_tracing() {
-    // Default filter: `warn`, but silence imap-codec's "Rectified missing text"
-    // noise from RFC-loose servers (263.net / QQ / etc.). Users can override via
-    // MAIL_CLI_LOG (e.g. `MAIL_CLI_LOG=imap_codec=warn,email=debug`).
+    // Default: only WARN and above from our crate; silence imap-codec's noisy
+    // "Rectified missing text" spam from RFC-loose servers. Set MAIL_CLI_LOG
+    // (e.g. `MAIL_CLI_LOG=mail_cli=info` or `mail_cli=debug`) to see pull
+    // progress messages and IMAP wire traces.
     let filter = EnvFilter::try_from_env("MAIL_CLI_LOG")
         .unwrap_or_else(|_| EnvFilter::new("warn,imap_codec=error"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)
+        .with_target(false)
+        .compact()
         .try_init();
 }
 

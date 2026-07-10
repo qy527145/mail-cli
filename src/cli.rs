@@ -206,10 +206,11 @@ pub struct MessagePullArgs {
     /// Body format returned in each message. `none` returns envelope-only (cheapest for agents).
     #[arg(long, value_enum, default_value_t = PullBodyFormat::Text)]
     pub body_format: PullBodyFormat,
-    /// Also fetch attachments and save each message's attachments into its own directory.
-    /// Default: attachments are NOT fetched (saves bandwidth and disk).
+    /// Skip attachment download. By default `pull` DOES fetch and save attachments
+    /// (one directory per message under `attachments_dir`) because that's what
+    /// most agent workflows want. Pass this to skip attachments (saves disk/RTT).
     #[arg(long)]
-    pub attachments: bool,
+    pub no_attachments: bool,
     /// Root directory for saved attachments. Defaults to
     /// `<data_local_dir>/mail-cli/attachments`. Each message gets its own
     /// subdirectory `<root>/<account>/<folder>/<uid>/`.
@@ -300,6 +301,9 @@ pub struct MessageDeleteArgs {
 pub enum AttachmentCommand {
     List(AttachmentListArgs),
     Download(AttachmentDownloadArgs),
+    /// Delete previously saved attachment directories (from `message pull --attachments`).
+    /// Requires at least one scoping flag; there is no accidental "clear all".
+    Clear(AttachmentClearArgs),
 }
 
 #[derive(Debug, clap::Args)]
@@ -320,6 +324,28 @@ pub struct AttachmentDownloadArgs {
     pub index: u32,
     #[arg(long)]
     pub output: PathBuf,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct AttachmentClearArgs {
+    /// Delete every message directory under the attachment root. Refuses to run without this.
+    #[arg(long, conflicts_with_all = ["older_than", "account_scope", "folder_scope"])]
+    pub all: bool,
+    /// Delete message dirs whose mtime is older than DURATION (e.g. `7d`, `24h`, `30m`).
+    #[arg(long, value_name = "DURATION")]
+    pub older_than: Option<String>,
+    /// Scope: only touch dirs under `<root>/<account>/`.
+    #[arg(long = "account-scope", value_name = "NAME")]
+    pub account_scope: Option<String>,
+    /// Scope: only touch dirs under `<root>/<account>/<folder>/`. Requires --account-scope.
+    #[arg(long = "folder-scope", value_name = "NAME", requires = "account_scope")]
+    pub folder_scope: Option<String>,
+    /// Override the attachment root (default: `<data_local_dir>/mail-cli/attachments`).
+    #[arg(long, value_name = "PATH")]
+    pub attachments_dir: Option<PathBuf>,
+    /// Preview what would be deleted without actually removing anything.
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Debug, Subcommand)]

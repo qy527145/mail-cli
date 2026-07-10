@@ -101,7 +101,16 @@ fn manifest() -> Value {
             },
             {
                 "path": "message pull",
-                "description": "Batch pull for agents. Filters by unread + optional date; fetches bodies (with async-imap fallback); optionally saves attachments to disk; batch-marks successful ones as read.",
+                "description": "Batch pull for agents. Filters by unread + optional date; fetches bodies with 3-layer fallback (email-lib SEARCH → async-imap SEARCH+FETCH → client-side paginated scan); saves attachments to disk by default; batch-marks successful ones as read.",
+                "defaults": {
+                    "folder": "INBOX",
+                    "limit": 20,
+                    "date_filter": "none (all history)",
+                    "read_state": "unread only",
+                    "mark_read_after_fetch": true,
+                    "body_format": "text",
+                    "attachments": true
+                },
                 "arguments": [
                     {"name": "--folder", "default": "INBOX"},
                     {"name": "--limit", "default": 20},
@@ -110,28 +119,27 @@ fn manifest() -> Value {
                     {"name": "--include-read", "type": "flag", "description": "include already-read messages (default: unread only)"},
                     {"name": "--peek", "type": "flag", "description": "don't mark any as read after fetching"},
                     {"name": "--body-format", "values": ["text", "none"], "default": "text"},
-                    {"name": "--attachments", "type": "flag", "description": "also save attachments to disk (default: skip)"},
+                    {"name": "--no-attachments", "type": "flag", "description": "SKIP attachments (default: attachments ARE downloaded)"},
                     {"name": "--attachments-dir", "value_name": "PATH", "description": "attachment root; default: <data_local_dir>/mail-cli/attachments"}
                 ],
                 "output_shape": {
                     "pulled": "N (envelopes returned)",
                     "marked_read": "count of ids batch-flagged \\Seen",
                     "marked_read_ids": ["<uid>", "..."],
+                    "filter_source": "server-search | async-imap-search | client-filter",
                     "attachments_saved": "bool",
                     "attachments_root": "root path or null",
                     "messages": [
                         {
                             "envelope": "<Envelope>",
                             "body_text": "<UNTRUSTED_EMAIL_BODY id=... sender=...>...</UNTRUSTED_EMAIL_BODY>",
-                            "html_stripped": "bool",
-                            "remote_resources_blocked": "u32",
-                            "fetch_source": "email-lib | async-imap",
-                            "attachments_dir": "<dir path when --attachments>",
+                            "fetch_source": "email-lib | async-imap-search | async-imap",
+                            "attachments_dir": "<dir>",
                             "attachments": [{"index": 0, "filename": "...", "mime_type": "...", "size": 0, "path": "..."}]
                         }
                     ]
                 },
-                "example": "mail-cli message pull --max-age 2h --limit 10 --attachments --json"
+                "example": "mail-cli message pull --max-age 2h --limit 10 --json"
             },
             {
                 "path": "message send",
@@ -161,6 +169,19 @@ fn manifest() -> Value {
             },
             {"path": "attachment list", "description": "List attachments in a message."},
             {"path": "attachment download", "description": "Download an attachment to a file."},
+            {
+                "path": "attachment clear",
+                "description": "Delete previously saved attachment directories. Requires at least one scoping flag (no accidental \"clear everything\").",
+                "arguments": [
+                    {"name": "--all", "type": "flag", "description": "wipe everything under attachment root"},
+                    {"name": "--older-than", "value_name": "DURATION", "description": "e.g. 7d, 24h"},
+                    {"name": "--account-scope", "value_name": "NAME", "description": "restrict to one account's subtree"},
+                    {"name": "--folder-scope", "value_name": "NAME", "description": "restrict to one folder (requires --account-scope)"},
+                    {"name": "--attachments-dir", "value_name": "PATH", "description": "override attachment root"},
+                    {"name": "--dry-run", "type": "flag", "description": "preview only"}
+                ],
+                "example": "mail-cli attachment clear --older-than 7d --dry-run"
+            },
             {"path": "config show", "description": "Show current configuration (no secrets)."}
         ],
         "envelope_schema": {

@@ -120,9 +120,13 @@ async fn read(args: MessageReadArgs, global: &GlobalArgs, fmt: OutputFormat) -> 
             "email-lib returned empty body (likely imap-client parser miss); \
              falling back to async-imap"
         );
-        let raw = crate::backend::async_imap_fetch::fetch_raw_by_uid(
+        let creds = crate::backend::async_imap_fetch::ImapCreds::resolve(
             &account.name,
             &account.cfg,
+        )
+        .await?;
+        let raw = crate::backend::async_imap_fetch::fetch_raw_by_uid(
+            &creds,
             &args.folder,
             &args.id,
         )
@@ -228,6 +232,80 @@ fn build_mime(
 
     b.write_to_vec()
         .map_err(|e| Error::Transient(format!("mime build: {e}")))
+}
+
+/// Build an IMAP SEARCH criteria string for use with async-imap `uid_search`.
+/// Combines `UNSEEN` (if we're filtering unread) with `SINCE <date>` (if we have
+/// a date cutoff). Returns `"ALL"` if no filters apply.
+fn build_imap_search_criteria(unread_only: bool, since: Option<chrono::NaiveDate>) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if unread_only {
+        parts.push("UNSEEN".into());
+    }
+    if let Some(d) = since {
+        // IMAP wire date: `1-Jan-2026`, locale-independent.
+        parts.push(format!("SINCE {}", d.format("%-d-%b-%Y")));
+    }
+    if parts.is_empty() {
+        "ALL".into()
+    } else {
+        parts.join(" ")
+    }
+}
+
+/// Synthesize an `email::envelope::Envelope` from raw RFC-822 bytes when we
+/// took the async-imap SEARCH shortcut. Fills the fields the rest of pull expects.
+fn synth_envelope_from_raw(
+    uid: &str,
+    is_seen: bool,
+    raw: &[u8],
+) -> Option<email::envelope::Envelope> {
+    use email::envelope::address::Address as EmailAddr;
+    let parsed = mail_parser::MessageParser::default().parse(raw)?;
+
+    let mut flags = Flags::default();
+    if is_seen {
+        flags.insert(Flag::Seen);
+    }
+
+    let from = parsed
+        .from()
+        .and_then(mail_parser::Address::first)
+        .map(|a| EmailAddr {
+            name: a.name().map(str::to_string),
+            addr: a.address().unwrap_or("").to_string(),
+        })
+        .unwrap_or_default();
+    let to = parsed
+        .to()
+        .and_then(mail_parser::Address::first)
+        .map(|a| EmailAddr {
+            name: a.name().map(str::to_string),
+            addr: a.address().unwrap_or("").to_string(),
+        })
+        .unwrap_or_default();
+
+    let date = parsed
+        .date()
+        .and_then(|d| chrono::DateTime::parse_from_rfc3339(&d.to_rfc3339()).ok())
+        .unwrap_or_else(|| {
+            chrono::DateTime::from_naive_utc_and_offset(
+                chrono::NaiveDateTime::default(),
+                chrono::FixedOffset::east_opt(0).unwrap(),
+            )
+        });
+
+    Some(email::envelope::Envelope {
+        id: uid.to_string(),
+        message_id: parsed.message_id().unwrap_or("").to_string(),
+        in_reply_to: None,
+        flags,
+        from,
+        to,
+        subject: parsed.subject().unwrap_or("").to_string(),
+        date,
+        has_attachment: parsed.attachment_count() > 0,
+    })
 }
 
 fn parse_since_date(s: &str) -> Result<chrono::NaiveDate> {
@@ -355,7 +433,24 @@ async fn pull(args: MessagePullArgs, global: &GlobalArgs, fmt: OutputFormat) -> 
     };
 
     let account = load_account(global)?;
+    tracing::info!(account = %account.name, "pull: loaded account config");
     let imap = account.open_imap().await?;
+
+    tracing::info!(
+        account = %account.name,
+        folder = %args.folder,
+        limit = args.limit,
+        "pull: imap connected, running SEARCH"
+    );
+
+    // Resolve IMAP credentials from the OS keyring ONCE up-front. Every
+    // subsequent async-imap call in this pull shares this struct — critical on
+    // macOS where each get_secret() may pop a Keychain authorization prompt.
+    let async_creds = crate::backend::async_imap_fetch::ImapCreds::resolve(
+        &account.name,
+        &account.cfg,
+    )
+    .await?;
 
     // Build filter: (NOT Seen) AND (AfterDate ...)
     let mut filter: Option<F> = None;
@@ -390,32 +485,86 @@ async fn pull(args: MessagePullArgs, global: &GlobalArgs, fmt: OutputFormat) -> 
         }),
     };
 
-    // Try the server-side SEARCH path first (fastest). If the server returns
-    // something imap-client can't parse (263.net Postfix has this problem on
-    // SEARCH just like it does on FETCH), fall back to fetching a wider window
-    // by sequence and filtering client-side.
+    // Attempt 1: email-lib server-side SEARCH (fast on well-behaved servers).
+    // Attempt 2: async-imap SEARCH + batch FETCH (one session for the whole request;
+    //            handles servers whose SEARCH breaks imap-client's parser, like 263.net).
+    // Attempt 3: client-side paginated envelope scan (last resort).
+    //
+    // If Attempt 2 succeeds, it comes back with raw bodies already fetched. We stash
+    // those in `prefetched_bodies` so the later fetch loop can skip the wasted
+    // email-lib peek attempts.
+    let mut prefetched_bodies: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
     let (envelopes, filter_source): (email::envelope::Envelopes, &'static str) =
         match imap.list_envelopes(&args.folder, opts).await {
             Ok(e) => (e, "server-search"),
-            Err(e) => {
+            Err(email_lib_err) => {
                 tracing::warn!(
-                    error = %e,
-                    "server-side SEARCH failed; falling back to client-side filter"
+                    error = %email_lib_err,
+                    "server-side SEARCH failed; trying async-imap SEARCH+FETCH shortcut"
                 );
-                let envs = client_side_filter(
-                    &imap,
+
+                let criteria = build_imap_search_criteria(!args.include_read, date_cutoff);
+                match crate::backend::async_imap_fetch::search_and_fetch(
+                    &async_creds,
                     &args.folder,
+                    &criteria,
                     args.limit as usize,
-                    args.include_read,
-                    date_cutoff,
                 )
-                .await?;
-                (envs, "client-filter")
+                .await
+                {
+                    Ok(msgs) if !msgs.is_empty() => {
+                        // Synthesize envelopes from raw MIME + IMAP flags. Stash raw
+                        // bodies so we don't refetch them.
+                        let mut envs: Vec<email::envelope::Envelope> = Vec::with_capacity(msgs.len());
+                        for m in msgs {
+                            if let Some(env) = synth_envelope_from_raw(&m.uid, m.is_seen, &m.raw_body) {
+                                envs.push(env);
+                            }
+                            prefetched_bodies.insert(m.uid, m.raw_body);
+                        }
+                        envs.sort_by(|a, b| b.date.cmp(&a.date));
+                        (
+                            email::envelope::Envelopes::from_iter(envs),
+                            "async-imap-search",
+                        )
+                    }
+                    Ok(_) => {
+                        // async-imap search returned zero — either mailbox is empty or
+                        // criteria matched nothing. Skip the client-filter fallback in
+                        // that case (there's nothing to find).
+                        (email::envelope::Envelopes::from_iter(Vec::new()), "async-imap-search")
+                    }
+                    Err(async_err) => {
+                        tracing::warn!(
+                            error = %async_err,
+                            "async-imap SEARCH failed too; falling back to client-side paginated scan"
+                        );
+                        let envs = client_side_filter(
+                            &imap,
+                            &args.folder,
+                            args.limit as usize,
+                            args.include_read,
+                            date_cutoff,
+                        )
+                        .await?;
+                        (envs, "client-filter")
+                    }
+                }
             }
         };
 
-    // Resolve attachments root once (only used if --attachments).
-    let attach_root: Option<PathBuf> = if args.attachments {
+    tracing::info!(
+        source = filter_source,
+        n = envelopes.len(),
+        "search returned {} envelopes (via {})",
+        envelopes.len(),
+        filter_source
+    );
+
+    // Resolve attachments root once (only used if attachments requested).
+    let want_attachments = !args.no_attachments;
+    let attach_root: Option<PathBuf> = if want_attachments {
         let root = match args.attachments_dir.clone() {
             Some(p) => p,
             None => default_attachments_root()?,
@@ -425,62 +574,151 @@ async fn pull(args: MessagePullArgs, global: &GlobalArgs, fmt: OutputFormat) -> 
         None
     };
 
-    let mut items: Vec<serde_json::Value> = Vec::with_capacity(envelopes.len());
-    let mut fetched_ids: Vec<String> = Vec::new();
+    let want_body = matches!(args.body_format, PullBodyFormat::Text);
+    let want_fetch = want_body || want_attachments;
+
+    // ── Body fetch: batch async-imap for all UIDs that don't already have
+    // prefetched bodies from the async-imap-search shortcut.
+    //
+    // Design change (2026-07-10): the previous implementation did a Pass 1
+    // "try email-lib peek per envelope, then Pass 2 batch async-imap for the
+    // ones that failed". On broken servers (263.net) EVERY email-lib peek
+    // downloads the full body over the wire only to have imap-client's parser
+    // discard it — 5 UIDs = 5 wasted body downloads (~120s). We now always use
+    // async-imap for the batch body fetch. Cost on well-behaved servers
+    // (QQ, Gmail): one extra IMAP connection (~500ms) instead of reusing the
+    // existing email-lib session — a good trade for the 120s recovery on 263.
+    let uids_needing_bodies: Vec<String> = if want_fetch {
+        envelopes
+            .iter()
+            .filter(|e| !prefetched_bodies.contains_key(&e.id))
+            .map(|e| e.id.clone())
+            .collect()
+    } else {
+        Vec::new()
+    };
+    if !uids_needing_bodies.is_empty() {
+        tracing::info!(
+            n = uids_needing_bodies.len(),
+            "fetching {} message bodies in parallel...",
+            uids_needing_bodies.len()
+        );
+        let started = std::time::Instant::now();
+        match crate::backend::async_imap_fetch::fetch_raw_by_uids_parallel(
+            &async_creds,
+            &args.folder,
+            &uids_needing_bodies,
+            None, // use default concurrency
+        )
+        .await
+        {
+            Ok(map) => {
+                let ms = started.elapsed().as_millis();
+                tracing::info!(
+                    fetched = map.len(),
+                    duration_ms = ms as u64,
+                    "body fetch done in {} ms",
+                    ms
+                );
+                for (uid, bytes) in map {
+                    prefetched_bodies.insert(uid, bytes);
+                }
+            }
+            Err(e) => tracing::warn!(error = %e, "parallel body fetch failed"),
+        }
+    }
+
+    // Build per-envelope content from prefetched raw bytes (or email-lib peek
+    // as last resort — some servers may only respond via that path if
+    // async-imap connections are blocked at the network layer).
+    let mut per_env: Vec<(email::envelope::Envelope, Option<FetchedMessage>)> =
+        Vec::with_capacity(envelopes.len());
 
     for env in envelopes.iter() {
-        let dto_env = convert::convert_envelope(env);
-        let mut row = serde_json::json!({ "envelope": dto_env });
-        let want_body = matches!(args.body_format, PullBodyFormat::Text);
-        let want_attach = args.attachments;
+        let content = if want_fetch {
+            if let Some(raw) = prefetched_bodies.get(&env.id) {
+                mail_parser::MessageParser::default()
+                    .parse(raw)
+                    .map(|parsed| {
+                        let (b, h, r) = extract_body(&parsed);
+                        let attachments = if want_attachments {
+                            extract_attachments_owned(&parsed)
+                        } else {
+                            Vec::new()
+                        };
+                        FetchedMessage {
+                            body_text: b,
+                            html_stripped: h,
+                            remote_resources: r,
+                            source: "async-imap",
+                            attachments,
+                        }
+                    })
+            } else {
+                // Last resort: original per-envelope email-lib peek.
+                try_email_lib_fetch(&imap, &args.folder, &env.id, want_attachments).await
+            }
+        } else {
+            None
+        };
+        per_env.push((env.clone(), content));
+    }
 
-        if want_body || want_attach {
-            match fetch_body_and_attachments(&account, &imap, &args.folder, &env.id, want_attach)
-                .await
-            {
-                Ok(content) => {
+    // ── Emit: build output; save attachments; track successful UIDs ──────
+    let mut items: Vec<serde_json::Value> = Vec::with_capacity(per_env.len());
+    let mut fetched_ids: Vec<String> = Vec::new();
+
+    for (env, content) in per_env {
+        let dto_env = convert::convert_envelope(&env);
+        let mut row = serde_json::json!({ "envelope": dto_env });
+
+        if want_fetch {
+            match content {
+                Some(c) => {
                     if want_body {
                         row["body_text"] = serde_json::Value::String(wrap_untrusted(
                             &env.id,
                             &env.from.addr,
-                            &content.body_text,
+                            &c.body_text,
                         ));
-                        row["html_stripped"] = serde_json::Value::Bool(content.html_stripped);
+                        row["html_stripped"] = serde_json::Value::Bool(c.html_stripped);
                         row["remote_resources_blocked"] =
-                            serde_json::Value::from(content.remote_resources);
+                            serde_json::Value::from(c.remote_resources);
                     }
-                    row["fetch_source"] = serde_json::Value::String(content.source.to_string());
+                    row["fetch_source"] = serde_json::Value::String(c.source.to_string());
 
-                    if want_attach {
+                    if want_attachments {
                         let root = attach_root.as_ref().unwrap();
                         let (dir, records) = save_attachments_to_dir(
                             root,
                             &account.name,
                             &args.folder,
                             &env.id,
-                            &content.attachments,
+                            &c.attachments,
                         )?;
-                        row["attachments_dir"] = serde_json::Value::String(
-                            dir.to_string_lossy().into_owned(),
-                        );
+                        row["attachments_dir"] =
+                            serde_json::Value::String(dir.to_string_lossy().into_owned());
                         row["attachments"] = serde_json::Value::Array(records);
                     }
                     fetched_ids.push(env.id.clone());
                 }
-                Err(e) => {
-                    // Fetch failed for this envelope — do NOT mark it read.
-                    warn!(id = %env.id, error = %e, "fetch failed; skipping mark-read for this id");
-                    row["fetch_error"] = serde_json::Value::String(e.to_string());
+                None => {
+                    // Both email-lib and fallback failed — don't mark this UID as read.
+                    if !row.get("fetch_error").is_some() {
+                        row["fetch_error"] = serde_json::Value::String(
+                            "both email-lib and async-imap fallback returned no body".into(),
+                        );
+                    }
                 }
             }
         } else {
-            // envelope-only mode still counts toward "fetched" (nothing to lose).
+            // envelope-only mode: everything counts as fetched
             fetched_ids.push(env.id.clone());
         }
         items.push(row);
     }
 
-    // Mark the successfully fetched ones as read (unless --peek or --read-only).
+    // ── Batch mark-read the ones we actually got ──────────────────────────
     let mut marked: Vec<String> = Vec::new();
     if !args.peek && !global.read_only && !fetched_ids.is_empty() {
         let flags = Flags::from_iter([Flag::Seen]);
@@ -511,6 +749,36 @@ async fn pull(args: MessagePullArgs, global: &GlobalArgs, fmt: OutputFormat) -> 
     )
 }
 
+/// Try email-lib's peek path and parse the message on the spot. Returns
+/// `Some(FetchedMessage)` on success. On failure (parser miss, empty response,
+/// network error), returns `None` — the caller decides whether to try the
+/// async-imap fallback.
+async fn try_email_lib_fetch(
+    imap: &email::backend::Backend<ImapContext>,
+    folder: &str,
+    uid: &str,
+    with_attachments: bool,
+) -> Option<FetchedMessage> {
+    let single_id: SingleId = uid.to_string().into();
+    let id = Id::single(single_id);
+    let msgs = imap.peek_messages(folder, &id).await.ok()?;
+    let msg = msgs.first()?;
+    let parsed = msg.parsed().ok()?;
+    let (b, h, r) = extract_body(parsed);
+    let attachments = if with_attachments {
+        extract_attachments_owned(parsed)
+    } else {
+        Vec::new()
+    };
+    Some(FetchedMessage {
+        body_text: b,
+        html_stripped: h,
+        remote_resources: r,
+        source: "email-lib",
+        attachments,
+    })
+}
+
 /// Rich fetch result for a single message. Owns all bytes so the parsed message
 /// can be dropped before we return.
 struct FetchedMessage {
@@ -522,10 +790,15 @@ struct FetchedMessage {
 }
 
 /// Client-side filter fallback for servers whose IMAP SEARCH implementation
-/// breaks imap-client's parser (e.g. 263.net Postfix). Fetches a wider window
-/// of recent envelopes without a search query, then applies the unread / date
-/// filter in Rust. Bounded by `10× limit`, capped at 500, so agents never
-/// accidentally pull a million-message mailbox into memory.
+/// breaks imap-client's parser (e.g. 263.net Postfix). Instead of one large
+/// SEARCH, we paginate small envelope fetches (newest-first sequence order)
+/// and apply the unread / date filter in Rust.
+///
+/// Optimizations that matter on slow servers:
+/// - `BATCH = 30` keeps each individual FETCH small (263.net times out on 200).
+/// - Early-stop: if a whole page's newest envelope is older than `date_cutoff`,
+///   subsequent pages (older sequence numbers) will be older too — bail immediately.
+/// - `MAX_PAGES = 20` caps total scan at 600 envelopes.
 async fn client_side_filter(
     imap: &email::backend::Backend<ImapContext>,
     folder: &str,
@@ -533,97 +806,74 @@ async fn client_side_filter(
     include_read: bool,
     date_cutoff: Option<chrono::NaiveDate>,
 ) -> Result<email::envelope::Envelopes> {
-    const HARD_CAP: usize = 500;
-    let window = (limit * 10).min(HARD_CAP).max(limit);
+    const BATCH: usize = 30;
+    const MAX_PAGES: usize = 20;
 
-    let opts = ListEnvelopesOptions {
-        page: 0,
-        page_size: window,
-        query: None, // no server-side SEARCH — plain sequence fetch
-    };
-    let raw = imap
-        .list_envelopes(folder, opts)
-        .await
-        .map_err(|e| Error::Transient(format!("list_envelopes (no query): {e}")))?;
+    let mut matches: Vec<email::envelope::Envelope> = Vec::with_capacity(limit);
 
-    let mut envs: Vec<email::envelope::Envelope> = raw
-        .iter()
-        .filter(|e| {
-            if !include_read && e.flags.contains(&Flag::Seen) {
-                return false;
+    for page in 0..MAX_PAGES {
+        let opts = ListEnvelopesOptions {
+            page,
+            page_size: BATCH,
+            query: None,
+        };
+        let batch = match imap.list_envelopes(folder, opts).await {
+            Ok(e) => e,
+            Err(e) => {
+                let msg = e.to_string();
+                if msg.contains("out of bounds") || msg.contains("page range") {
+                    break;
+                }
+                return Err(Error::Transient(format!(
+                    "list_envelopes (client-filter page {page}): {e}"
+                )));
+            }
+        };
+
+        let returned = batch.len();
+        if returned == 0 {
+            break;
+        }
+
+        // Early stop: if the newest envelope in this page is already older
+        // than the cutoff, subsequent pages (older sequence numbers) are also
+        // older. Don't waste RTTs.
+        if let Some(cutoff) = date_cutoff {
+            let newest = batch.iter().map(|e| e.date).max();
+            if let Some(newest) = newest
+                && newest.date_naive() < cutoff
+            {
+                tracing::debug!(page, "all envelopes in page older than cutoff — stopping");
+                break;
+            }
+        }
+
+        for env in batch.iter() {
+            if !include_read && env.flags.contains(&Flag::Seen) {
+                continue;
             }
             if let Some(cutoff) = date_cutoff
-                && e.date.date_naive() < cutoff
+                && env.date.date_naive() < cutoff
             {
-                return false;
+                continue;
             }
-            true
-        })
-        .cloned()
-        .collect();
-    // Newest first
-    envs.sort_by(|a, b| b.date.cmp(&a.date));
-    envs.truncate(limit);
-    Ok(email::envelope::Envelopes::from_iter(envs))
-}
-
-/// Fetch body (+ optionally attachments) for a single UID. Tries email-lib
-/// (peek) first; on empty or parse failure, falls back to async-imap.
-async fn fetch_body_and_attachments(
-    account: &AccountHandle,
-    imap: &email::backend::Backend<ImapContext>,
-    folder: &str,
-    uid: &str,
-    with_attachments: bool,
-) -> Result<FetchedMessage> {
-    let single_id: SingleId = uid.to_string().into();
-    let id = Id::single(single_id);
-
-    if let Ok(msgs) = imap.peek_messages(folder, &id).await {
-        if let Some(msg) = msgs.first() {
-            if let Ok(parsed) = msg.parsed() {
-                let (b, h, r) = extract_body(parsed);
-                let attachments = if with_attachments {
-                    extract_attachments_owned(parsed)
-                } else {
-                    Vec::new()
-                };
-                return Ok(FetchedMessage {
-                    body_text: b,
-                    html_stripped: h,
-                    remote_resources: r,
-                    source: "email-lib",
-                    attachments,
-                });
+            matches.push(env.clone());
+            if matches.len() >= limit {
+                break;
             }
+        }
+
+        if matches.len() >= limit {
+            break;
+        }
+        if returned < BATCH {
+            break;
         }
     }
 
-    // Fallback: async-imap direct fetch
-    tracing::warn!(uid, "email-lib empty/parse-fail; async-imap fallback");
-    let raw = crate::backend::async_imap_fetch::fetch_raw_by_uid(
-        &account.name,
-        &account.cfg,
-        folder,
-        uid,
-    )
-    .await?;
-    let parsed = mail_parser::MessageParser::default()
-        .parse(&raw)
-        .ok_or_else(|| Error::Transient("failed to parse RFC822 from fallback".into()))?;
-    let (b, h, r) = extract_body(&parsed);
-    let attachments = if with_attachments {
-        extract_attachments_owned(&parsed)
-    } else {
-        Vec::new()
-    };
-    Ok(FetchedMessage {
-        body_text: b,
-        html_stripped: h,
-        remote_resources: r,
-        source: "async-imap",
-        attachments,
-    })
+    matches.sort_by(|a, b| b.date.cmp(&a.date));
+    matches.truncate(limit);
+    Ok(email::envelope::Envelopes::from_iter(matches))
 }
 
 async fn send(args: MessageSendArgs, global: &GlobalArgs, fmt: OutputFormat) -> Result<()> {
